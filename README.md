@@ -2,17 +2,16 @@
 
 C implementation of the `str` ports (via the C ffi).
 
-Part of the `handl-lang` org split (ADR-0128). This repo is a **skeleton**:
-the layout and gate are in place, the implementation has not landed yet.
+This repo is a **skeleton**: the layout and gate are in place, the
+implementation has not landed yet (`src/` holds only `.gitkeep`).
 
 ## Layout
 
 ```text
 src/        the .hnl sources (empty until the implementation lands)
-pkg.hnl     dependencies, when any: `{ deps: { <name>: "branch:<ref>" } }`
+pkg.hnl     package manifest — modules, deps, description, license
+ci.sh       bupha entry → scripts/hnl-gate.sh
 ```
-
-Dependencies: str
 
 ## Gate
 
