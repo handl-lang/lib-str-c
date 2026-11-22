@@ -132,11 +132,13 @@ c_memmem_hp := (hp, hl, nbv, nl) ~> ffi.call(LIBC, "memmem", [hp, hl, nbv, nl], 
 
 --- First match byte-offset >= `from`, or -1. `hp`/`hl` describe the
 --- malloc'd haystack copy; `nbv`/`nl` the needle.
-next_match := (hp, hl, nbv, nl, from) ~> if from > hl - nl {
+next_match := (hp, hl, nbv, nl, off) ~> if off > hl - nl {
   -1
 } else {
-  r := c_memmem_hp(hp + from, hl - from, nbv, nl)
-  if r == null || r == 0 { -1 } else { r - hp }
+  do {
+    r := c_memmem_hp(hp + off, hl - off, nbv, nl)
+    if r == null || r == 0 { -1 } else { r - hp }
+  }
 }
 
 -- list helpers -----------------------------------------------------------------
