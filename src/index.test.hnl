@@ -1,0 +1,262 @@
+--- Tests for `str-c` -- the C/ICU backend of the `str` contract.
+---
+--- @details
+--- Covers the full 45-op surface: the libc/ICU fast paths
+--- (search/case/index/slice) and the `str-handl`-delegated algorithmic
+--- ops. ICU-gated assertions fall back to the per-char path's expected
+--- values, which agree on everything except context-sensitive Final_Sigma
+--- -- the sigma tests assert the ICU (native `str::to_lowercase`)
+--- semantics and are skipped when `icu_available` is false.
+
+from "./index" import * as m
+
+res_tag :: r ~> match r { ok(_): "ok", err(_): "err", _: "?" }
+
+-- diagnostics -------------------------------------------------------------------
+
+test_icu_flags_bool :: assert(m.icu_available == true || m.icu_available == false) = true
+
+test_icu_version_nonneg :: assert(m.icu_version >= 0) = true
+
+-- case mapping -------------------------------------------------------------------
+
+test_upper_basic :: assert m.upper("hEllO") = "HELLO"
+
+test_upper_empty :: assert m.upper("") = ""
+
+test_upper_unicode :: assert m.upper("héllo") = "HÉLLO"
+
+test_upper_expansion :: assert m.upper("ß") = "SS"
+
+test_lower_basic :: assert m.lower("HeLLo") = "hello"
+
+test_lower_empty :: assert m.lower("") = ""
+
+test_lower_unicode :: assert m.lower("HÉLLO") = "héllo"
+
+-- Final_Sigma: ICU u_strToLower matches Rust str::to_lowercase ("ος");
+-- the per-char fallback yields "οσ". Assert the ICU result only when the
+-- ICU path is live.
+test_lower_final_sigma :: assert(if m.icu_available {
+  m.lower("ΟΣ") == "ος"
+} else {
+  true
+}) = true
+
+test_capitalize :: assert m.capitalize("hELLO") = "Hello"
+
+test_capitalize_empty :: assert m.capitalize("") = ""
+
+test_title_case :: assert m.title_case("hello world") = "Hello World"
+
+test_snake_case :: assert m.snake_case("HelloWorld") = "hello_world"
+
+test_camel_case :: assert m.camel_case("hello world") = "helloWorld"
+
+test_pascal_case :: assert m.pascal_case("hello world") = "HelloWorld"
+
+test_kebab_case :: assert m.kebab_case("Hello World") = "hello-world"
+
+-- trim family ----------------------------------------------------------------------
+
+test_trim :: assert m.trim("  hi  ") = "hi"
+
+test_trim_empty :: assert m.trim("") = ""
+
+test_trim_all_ws :: assert m.trim("   ") = ""
+
+test_trim_start :: assert m.trim_start("  hi  ") = "hi  "
+
+test_trim_end :: assert m.trim_end("  hi  ") = "  hi"
+
+test_trim_matches :: assert m.trim_matches("xxhixx", "x") = "hi"
+
+test_trim_matches_empty_set :: assert m.trim_matches("abc", "") = "abc"
+
+-- length / concat / predicates -----------------------------------------------------
+
+test_length_ascii :: assert m.length("hello") = 5
+
+test_length_unicode :: assert m.length("héllo") = 5
+
+test_length_astral :: assert m.length("😀") = 1
+
+test_length_empty :: assert m.length("") = 0
+
+test_concat :: assert m.concat("foo", "bar") = "foobar"
+
+test_is_empty :: assert m.is_empty("") = true
+
+test_is_empty_false :: assert m.is_empty("x") = false
+
+test_equals :: assert m.equals("abc", "abc") = true
+
+test_equals_false :: assert m.equals("abc", "abd") = false
+
+test_is_alpha :: assert m.is_alpha("abc") = true
+
+test_is_alpha_false :: assert m.is_alpha("ab1") = false
+
+test_is_alpha_empty :: assert m.is_alpha("") = false
+
+test_is_numeric :: assert m.is_numeric("123") = true
+
+test_is_numeric_false :: assert m.is_numeric("12a") = false
+
+test_is_alphanumeric :: assert m.is_alphanumeric("ab12") = true
+
+test_is_alphanumeric_false :: assert m.is_alphanumeric("ab ") = false
+
+-- search ---------------------------------------------------------------------------
+
+test_contains :: assert m.contains("hello world", "world") = true
+
+test_contains_false :: assert m.contains("hello", "xyz") = false
+
+test_contains_empty :: assert m.contains("abc", "") = true
+
+test_contains_empty_hay :: assert m.contains("", "x") = false
+
+test_starts_with :: assert m.starts_with("hello", "he") = true
+
+test_starts_with_false :: assert m.starts_with("hello", "lo") = false
+
+test_starts_with_empty :: assert m.starts_with("abc", "") = true
+
+test_ends_with :: assert m.ends_with("hello", "lo") = true
+
+test_ends_with_false :: assert m.ends_with("hello", "he") = false
+
+test_ends_with_empty :: assert m.ends_with("abc", "") = true
+
+test_count :: assert m.count("banana", "an") = 2
+
+test_count_none :: assert m.count("abc", "x") = 0
+
+test_count_empty :: assert m.count("ab", "") = 3
+
+test_find :: assert m.find("hello world", "world") = 6
+
+test_find_none :: assert m.find("hello", "xyz") = -1
+
+test_find_empty :: assert m.find("abc", "") = 0
+
+test_find_multibyte :: assert m.find("aéb", "éb") = 1
+
+test_rfind :: assert m.rfind("banana", "an") = 3
+
+test_rfind_overlap :: assert m.rfind("aaaa", "aa") = 2
+
+test_rfind_none :: assert m.rfind("abc", "x") = -1
+
+test_rfind_empty :: assert m.rfind("ab", "") = 2
+
+-- transform -------------------------------------------------------------------------
+
+test_split :: assert m.split("a,b,c", ",") = ["a", "b", "c"]
+
+test_split_empty_pieces :: assert m.split("a,,b", ",") = ["a", "", "b"]
+
+test_split_no_sep :: assert m.split("abc", "x") = ["abc"]
+
+test_split_empty_sep :: assert m.split("ab", "") = ["", "a", "b", ""]
+
+test_split_whole :: assert m.split("abc", "abc") = ["", ""]
+
+test_join :: assert m.join(["a", "b", "c"], "-") = "a-b-c"
+
+test_join_empty :: assert m.join([], "-") = ""
+
+test_join_single :: assert m.join(["a"], "-") = "a"
+
+test_replace :: assert m.replace("banana", "an", "AN") = "bANANa"
+
+test_replace_all :: assert m.replace("aaa", "a", "b") = "bbb"
+
+test_replace_none :: assert m.replace("abc", "x", "y") = "abc"
+
+test_replace_first :: assert m.replace_first("banana", "an", "AN") = "bANana"
+
+test_replace_first_none :: assert m.replace_first("abc", "x", "y") = "abc"
+
+test_replace_empty_old :: assert m.replace("ab", "", "X") = "XaXbX"
+
+test_replace_empty_old_empty :: assert m.replace("", "", "X") = "X"
+
+test_replace_first_empty_old :: assert m.replace_first("ab", "", "X") = "Xab"
+
+test_repeat :: assert m.repeat("ab", 3) = "ababab"
+
+test_repeat_zero :: assert m.repeat("ab", 0) = ""
+
+test_char_at :: assert m.char_at("hello", 1) = "e"
+
+test_char_at_unicode :: assert m.char_at("héllo", 1) = "é"
+
+test_char_at_astral :: assert m.char_at("a😀b", 1) = "😀"
+
+test_slice :: assert m.slice("hello", 1, 4) = "ell"
+
+test_slice_unicode :: assert m.slice("héllo", 1, 3) = "él"
+
+test_slice_clamp :: assert m.slice("abc", 1, 99) = "bc"
+
+test_strip_prefix :: assert m.strip_prefix("hello", "he") = "llo"
+
+test_strip_prefix_absent :: assert m.strip_prefix("hello", "xy") = "hello"
+
+test_strip_prefix_empty :: assert m.strip_prefix("abc", "") = "abc"
+
+test_strip_suffix :: assert m.strip_suffix("hello", "lo") = "hel"
+
+test_strip_suffix_absent :: assert m.strip_suffix("hello", "xy") = "hello"
+
+test_split_at :: assert m.split_at("hello", 2) = ["he", "llo"]
+
+test_split_at_clamp :: assert m.split_at("abc", 99) = ["abc", ""]
+
+test_truncate :: assert m.truncate("hello world", 8) = "hello..."
+
+test_truncate_short :: assert m.truncate("hi", 8) = "hi"
+
+test_truncate_tiny :: assert m.truncate("hello", 2) = "he"
+
+-- delegated algorithmic ops -----------------------------------------------------------
+
+test_reverse :: assert m.reverse("abc") = "cba"
+
+test_reverse_unicode :: assert m.reverse("héllo") = "olléh"
+
+test_lines :: assert m.lines("a\nb") = ["a", "b"]
+
+test_lines_crlf :: assert m.lines("a\r\nb") = ["a", "b"]
+
+test_lines_trailing :: assert m.lines("a\n") = ["a"]
+
+test_lines_empty :: assert m.lines("") = [""]
+
+test_split_whitespace :: assert m.split_whitespace("  a  b\tc ") = ["a", "b", "c"]
+
+test_slugify :: assert m.slugify("Hello World!") = "hello-world"
+
+test_pad_left :: assert m.pad_left("5", 3, "0") = "005"
+
+test_pad_right :: assert m.pad_right("5", 3, "0") = "500"
+
+test_pad_noop :: assert m.pad_left("abc", 2, "0") = "abc"
+
+test_pad_empty_pad :: assert m.pad_left("ab", 5, "") = "ab"
+
+test_levenshtein :: assert m.levenshtein("kitten", "sitting") = 3
+
+test_levenshtein_same :: assert m.levenshtein("abc", "abc") = 0
+
+test_similarity_same :: assert m.similarity("abc", "abc") = 1.0
+
+test_word_wrap :: assert m.word_wrap("hello world foo", 11) = "hello world\nfoo"
+
+-- ffi failure surface ------------------------------------------------------------------
+
+-- char_at out of bounds raises (error.try captures it as an err result)
+test_char_at_oob_try :: assert res_tag(
+  error.try((x) ~> m.char_at("abc", 5))) = "err"

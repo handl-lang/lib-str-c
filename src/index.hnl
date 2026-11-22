@@ -1,0 +1,803 @@
+--- str-c -- the C/ICU backend for the `str` contract.
+---
+--- @details
+--- Hybrid architecture, chosen so every op runs at native speed where a
+--- native primitive exists and reuses the verified reference semantics
+--- where it does not:
+---
+--- - **libc byte ops** (`ffi.call("libc.so.6", ...)`): `memcmp` for
+---   `equals`/`starts_with`/`ends_with`/`strip_prefix`/`strip_suffix`,
+---   `memmem` for `contains`/`count`/`find`/`rfind`/`split`/`replace`/
+---   `replace_first`. UTF-8 is self-synchronising -- a valid UTF-8 needle
+---   can only match at a scalar boundary -- so byte search is exact.
+---   `find`/`rfind` map the byte offset back to a scalar index by
+---   counting non-continuation bytes.
+--- - **ICU4C case mapping** (`libicuuc`, versioned `u_strToUpper_N` /
+---   `u_strToLower_N` discovered exactly like `unicode-c` does): whole-
+---   string case maps match the native Rust `str::to_uppercase` /
+---   `to_lowercase` semantics, including context-sensitive Final_Sigma
+---   (`"ΟΣ"` -> `"ος"`). Strings are marshalled as little-endian UTF-16
+---   (`UChar`) buffers -- the codec is vendored from `unicode-c`.
+---   When ICU is absent the exports fall back to the per-char
+---   `char.to_upper`/`char.to_lower` map (`str-handl` semantics).
+--- - **Char-index slicing** (`char_at`/`slice`/`split_at`/`truncate`):
+---   a UTF-8 scalar-offset table (`offs_of`) gives byte ranges per char
+---   index; the window is sliced as `Bytes` and `bytes.utf8_decode`d --
+---   O(n) with no per-char `char.at` calls.
+--- - **Delegated ops**: the sequential Unicode algorithms -- `trim*`,
+---   `reverse`, the `is_*` classifiers, `capitalize`, `title_case`, the
+---   four case conversions, `levenshtein`, `similarity`, `lines`,
+---   `split_whitespace`, `slugify`, `word_wrap`, `pad_*` -- delegate to
+---   `str-handl`, the pure-handl reference implementation of this same
+---   contract over the `char` floor (itself native-backed by
+---   `char-native`). This keeps one source of truth for the fiddly
+---   semantics (aconym word splitting, CRLF lines, wrap rules) instead
+---   of forking them.
+---
+--- Public fields return plain contract values (`String`/`Int`/`Bool`/
+--- `List`); allocation/ICU failures raise via `error.raise`, matching
+--- the `*-c` convention. `icu_available`/`icu_version` are diagnostic
+--- extras (the `unicode-c` precedent), not contract ops.
+---
+--- `ffi`, `type`, `math`, `error`, `char`, `bytes`, `result` resolve
+--- through the host module chain or explicit imports -- the intl-c
+--- convention.
+
+from "result" import { ok, err }
+from "bytes" import * as bytes
+from "char" import * as char
+from "str-handl" import * as sh
+
+-- ffi / ICU probing ---------------------------------------------------------
+
+LIBC := "libc.so.6"
+
+--- `ffi.load`/`ffi.sym` return `{__tag__: "ok"}` / `{__tag__: "err", ...}`.
+is_ok := (r) ~> match r { ok(_): true, _: false }
+
+try_load := (name) ~> if is_ok(ffi.load(name)) { name } else { null }
+
+--- `stem` is e.g. "libicuuc.so"; probe the bare soname, then `stem.<major>`.
+find_lib := (stem) ~> do {
+  hit := try_load(stem)
+  if hit != null {
+    hit
+  } else {
+    while { v: 99, found: null } {
+      (v, found) ~> if found != null || v < 50 {
+        { out: found }
+      } else {
+        { state: { v: v - 1, found: try_load(stem + "." + type.to_string(v)) } }
+      }
+    }
+  }
+}
+
+--- ICU renames exported symbols with the library major (`u_charType_78`).
+--- Probe `u_getVersion_N` to discover N.
+find_version := (lib) ~> while { v: 99, found: 0 } {
+  (v, found) ~> if found > 0 || v < 50 {
+    { out: found }
+  } else {
+    { state: { v: v - 1, found: if is_ok(ffi.sym(lib, "u_getVersion_" + type.to_string(v))) { v } else { 0 } } }
+  }
+}
+
+--- NOTE: every call into this module re-evaluates these privates;
+--- `ffi.load`/`ffi.sym` hits are cached in the runtime so re-probing is
+--- cheap (the `unicode-c` convention).
+uc := find_lib("libicuuc.so")
+
+icu_ver := if uc == null { 0 } else { find_version(uc) }
+
+avail := uc != null && icu_ver > 0
+
+--- Versioned ICU case-map symbols, probed once at module load.
+up_sym := if avail {
+  do {
+    s := "u_strToUpper_" + type.to_string(icu_ver)
+    if is_ok(ffi.sym(uc, s)) { s } else { null }
+  }
+} else {
+  null
+}
+
+lo_sym := if avail {
+  do {
+    s := "u_strToLower_" + type.to_string(icu_ver)
+    if is_ok(ffi.sym(uc, s)) { s } else { null }
+  }
+} else {
+  null
+}
+
+icu_case_ok := up_sym != null && lo_sym != null
+
+-- libc helpers ----------------------------------------------------------------
+
+libc_malloc := (n) ~> ffi.call(LIBC, "malloc", [n], ["i64"], "ptr", false)
+
+libc_free := (p) ~> ffi.call(LIBC, "free", [p], ["ptr"], "void", false)
+
+libc_memcpy := (dst, src, n) ~> ffi.call(LIBC, "memcpy", [dst, src, n], ["ptr", "in_ptr", "i64"], "ptr", false)
+
+--- memcmp(3): 0 iff the first `n` bytes agree. `in_ptr` hands C the raw
+--- buffer pointer; lengths travel as explicit `i64` args.
+c_memcmp := (a, b, n) ~> ffi.call(LIBC, "memcmp", [a, b, n], ["in_ptr", "in_ptr", "i64"], "i32", false)
+
+--- memmem(3) against an already-materialised haystack pointer: args are
+--- (haystack_ptr, haystack_len, needle_bytes, needle_len); the needle
+--- `Bytes` marshals through `in_ptr`. Returns the match address or 0.
+c_memmem_hp := (hp, hl, nbv, nl) ~> ffi.call(LIBC, "memmem", [hp, hl, nbv, nl], ["ptr", "i64", "in_ptr", "i64"], "ptr", false)
+
+--- First match byte-offset >= `from`, or -1. `hp`/`hl` describe the
+--- malloc'd haystack copy; `nbv`/`nl` the needle.
+next_match := (hp, hl, nbv, nl, from) ~> if from > hl - nl {
+  -1
+} else {
+  r := c_memmem_hp(hp + from, hl - from, nbv, nl)
+  if r == null || r == 0 { -1 } else { r - hp }
+}
+
+-- list helpers -----------------------------------------------------------------
+
+list_len := (xs) ~> while { xs: xs, n: 0 } {
+  (xs, n) ~> match xs {
+    []: { out: n },
+    [_, ...t]: { state: { xs: t, n: n + 1 } }
+  }
+}
+
+l_rev := (xs) ~> while { xs: xs, acc: [] } {
+  (xs, acc) ~> match xs {
+    []: { out: acc },
+    [h, ...t]: { state: { xs: t, acc: [h, ...acc] } }
+  }
+}
+
+drop := (xs, n) ~> while { xs: xs, n: n } {
+  (xs, n) ~> if n <= 0 {
+    { out: xs }
+  } else {
+    match xs {
+      []: { out: xs },
+      [_, ...t]: { state: { xs: t, n: n - 1 } }
+    }
+  }
+}
+
+at := (xs, i) ~> match drop(xs, i) {
+  [h, ..._]: h,
+  _: null
+}
+
+l_map := (xs, f) ~> while { xs: xs, acc: [] } {
+  (xs, acc) ~> match xs {
+    []: { out: l_rev(acc) },
+    [h, ...t]: { state: { xs: t, acc: [f(h), ...acc] } }
+  }
+}
+
+-- UTF-16 codec (vendored from unicode-c) ----------------------------------------
+
+--- UTF-8 decode over integer bytes: continuation bytes contribute 6 bits.
+u8_cp1 := (b, t) ~> match t {
+  [b1, ...t1]: { cp: math.bit_or(math.shl(math.bit_and(b, 31), 6), math.bit_and(b1, 63)), rest: t1 },
+  _: { cp: 65533, rest: t }
+}
+
+u8_cp2 := (b, t) ~> match t {
+  [b1, b2, ...t2]: {
+    cp: math.bit_or(math.bit_or(math.shl(math.bit_and(b, 15), 12), math.shl(math.bit_and(b1, 63), 6)), math.bit_and(b2, 63)),
+    rest: t2
+  },
+  _: { cp: 65533, rest: [] }
+}
+
+u8_cp3 := (b, t) ~> match t {
+  [b1, b2, b3, ...t3]: {
+    cp: math.bit_or(math.bit_or(math.shl(math.bit_and(b, 7), 18), math.shl(math.bit_and(b1, 63), 12)), math.bit_or(math.shl(math.bit_and(b2, 63), 6), math.bit_and(b3, 63))),
+    rest: t3
+  },
+  _: { cp: 65533, rest: [] }
+}
+
+--- LE bytes of a UTF-16 unit pair (lead surrogate first). The list literal
+--- must be the arrow body itself -- a line-leading `[...]` after a binding
+--- parses as indexing, not a new list.
+u16_le_bytes := (hi, lo) ~> [math.bit_and(hi, 255), math.shr(hi, 8), math.bit_and(lo, 255), math.shr(lo, 8)]
+
+--- cp >= 0x10000 -> surrogate pair. Returns LE bytes, lead surrogate first.
+enc_pair := (u) ~> u16_le_bytes(55296 + math.shr(u, 10), 56320 + math.bit_and(u, 1023))
+
+enc_cp := (cp) ~> if cp < 65536 {
+  [math.bit_and(cp, 255), math.shr(cp, 8)]
+} else {
+  enc_pair(cp - 65536)
+}
+
+--- one UTF-8 step: decode the head byte's class and append its LE u16 bytes
+u8_step := (b, t, acc) ~> if b < 128 {
+  { state: { bs: t, acc: [...acc, ...enc_cp(b)] } }
+} else if b < 224 {
+  s := u8_cp1(b, t)
+  { state: { bs: s.rest, acc: [...acc, ...enc_cp(s.cp)] } }
+} else if b < 240 {
+  s := u8_cp2(b, t)
+  { state: { bs: s.rest, acc: [...acc, ...enc_cp(s.cp)] } }
+} else {
+  s := u8_cp3(b, t)
+  { state: { bs: s.rest, acc: [...acc, ...enc_cp(s.cp)] } }
+}
+
+--- string -> { bytes: Bytes, len: <u16 unit count> }
+utf16_enc := (s) ~> while { bs: bytes.to_list(bytes.utf8_encode(s)), acc: [] } {
+  (bs, acc) ~> match bs {
+    []: { out: { bytes: bytes.from_list(acc), len: math.shr(list_len(acc), 1) } },
+    [b, ...t]: u8_step(b, t, acc)
+  }
+}
+
+--- LE byte list -> u16 unit list
+to_units := (bs) ~> while { bs: bs, acc: [] } {
+  (bs, acc) ~> match bs {
+    []: { out: acc },
+    [lo]: { out: [...acc, lo] },
+    [lo, hi, ...t]: { state: { bs: t, acc: [...acc, lo + hi * 256] } }
+  }
+}
+
+--- combine a lead surrogate `hi` with the next unit of `us`; `n`/`acc` are
+--- the decode loop's remaining-unit budget and char accumulator
+dec_rest := (hi, us, n, acc) ~> match us {
+  []: { out: char.from_chars(acc) },
+  [lo, ...t]: { state: { us: t, n: n - 2, acc: [...acc, char.from_code_point(65536 + (hi - 55296) * 1024 + lo - 56320)] } }
+}
+
+--- one decode step: BMP unit, or a surrogate pair consuming two units
+dec_step := (u, t, n, acc) ~> if u >= 55296 && u < 56320 {
+  dec_rest(u, t, n, acc)
+} else {
+  { state: { us: t, n: n - 1, acc: [...acc, char.from_code_point(u)] } }
+}
+
+--- decode only the first `n` of unit list `us` (ICU reports the written
+--- length in `ret`; `out_ptr` returns the whole capacity)
+utf16_dec := (us, n) ~> while { us: us, n: n, acc: [] } {
+  (us, n, acc) ~> match us {
+    []: { out: char.from_chars(acc) },
+    [u, ...t]: if n <= 0 {
+      { out: char.from_chars(acc) }
+    } else {
+      dec_step(u, t, n, acc)
+    }
+  }
+}
+
+--- LE bytes of an out_ptr buffer, trimmed to `n` units, decoded to a string
+rd16 := (buf, n) ~> utf16_dec(to_units(bytes.to_list(bytes.slice(buf, 0, n * 2))), n)
+
+-- ICU case mapping ----------------------------------------------------------------
+
+--- u_strToUpper/u_strToLower over the UTF-16 encoding. Returns
+--- `ok <String>` / `err "<msg>"` (result ctors). `cap` grows and retries
+--- when ICU reports U_BUFFER_OVERFLOW (ret = needed units).
+icu_xcase := (s, sym) ~> do {
+  e := utf16_enc(s)
+  while { cap: e.len * 3 + 32, tries: 0 } {
+    (cap, tries) ~> do {
+      desc := "out_ptr:" + type.to_string(cap * 2)
+      r := ffi.call(uc, sym, [cap, e.bytes, e.len, "", 0, 0],
+        [desc, "i32", "in_ptr", "i32", "cstr", "u32", "io_scalar:i32"], "i32", false)
+      if type.of(r) != "object" {
+        { out: err("ffi call failed") }
+      } else {
+        do {
+          vs := r.vals
+          st := if type.of(vs) == "list" && list_len(vs) > 0 {
+            at(vs, list_len(vs) - 1)
+          } else {
+            0
+          }
+          if r.ret > cap && tries < 2 {
+            { state: { cap: r.ret + 16, tries: tries + 1 } }
+          } else if st > 0 {
+            { out: err("icu case map failed code " + type.to_string(st)) }
+          } else {
+            { out: ok(rd16(r.buf, r.ret)) }
+          }
+        }
+      }
+    }
+  }
+}
+
+--- per-char fallback when ICU is unavailable (str-handl semantics)
+case_fallback := (s, which) ~> char.from_chars(l_map(char.chars(s), c ~> if which == "upper" { char.to_upper(c) } else { char.to_lower(c) }))
+
+-- byte helpers ---------------------------------------------------------------------
+
+bts := (s) ~> bytes.utf8_encode(s)
+
+nb := (b) ~> bytes.len(b)
+
+--- scalar count of a UTF-8 byte list prefix: lead bytes are <0x80 or >=0xC2
+is_lead := (b) ~> b < 128 || b >= 192
+
+chars_before := (bs, p) ~> while { bs: bs, p: p, n: 0 } {
+  (bs, p, n) ~> if p <= 0 {
+    { out: n }
+  } else {
+    match bs {
+      []: { out: n },
+      [b, ...t]: { state: { bs: t, p: p - 1, n: n + (if is_lead(b) { 1 } else { 0 }) } }
+    }
+  }
+}
+
+--- UTF-8 byte offset of each scalar value, ascending. `offs[i]` is the
+--- byte index where char `i` starts; the implicit `offs[n]` is the byte
+--- length.
+offs_of := (hb) ~> do {
+  lead_len := (b) ~> if b < 128 { 1 } else if b < 224 { 2 } else if b < 240 { 3 } else { 4 }
+  bl := bytes.to_list(hb)
+  while { bs: bl, off: 0, acc: [] } {
+    (bs, off, acc) ~> match bs {
+      []: { out: l_rev(acc) },
+      [b, ...t]: do {
+        w := lead_len(b)
+        { state: { bs: drop(t, w - 1), off: off + w, acc: [off, ...acc] } }
+      }
+    }
+  }
+}
+
+--- character (scalar) count -- NOT bytes.
+str_length := (s) ~> do {
+  bs := bytes.to_list(bts(s))
+  while { bs: bs, n: 0 } {
+    (bs, n) ~> match bs {
+      []: { out: n },
+      [b, ...t]: { state: { bs: t, n: n + (if is_lead(b) { 1 } else { 0 }) } }
+    }
+  }
+}
+
+--- char-index slice `s[a..b)` clamped to `[0, n]` like the native impl.
+str_slice := (s, a, b) ~> do {
+  hb := bts(s)
+  bl := nb(hb)
+  offs := offs_of(hb)
+  n := list_len(offs)
+  bb := if b < 0 { 0 } else if b > n { n } else { b }
+  aa := if a < 0 { 0 } else if a > bb { bb } else { a }
+  if aa >= bb {
+    ""
+  } else {
+    so := at(offs, aa)
+    eo := if bb >= n { bl } else { at(offs, bb) }
+    bytes.utf8_decode(bytes.slice(hb, so, eo - so))
+  }
+}
+
+--- All non-overlapping (`overlap=false`) or every-position
+--- (`overlap=true`) byte offsets where `nbv` occurs in `hb`. One
+--- malloc/memcpy/free per scan; the haystack pointer stays valid for
+--- the whole loop.
+scan_matches := (hb, nbv, overlap) ~> do {
+  hl := nb(hb)
+  nl := nb(nbv)
+  if nl == 0 || nl > hl {
+    []
+  } else {
+    p := libc_malloc(hl)
+    if p == 0 {
+      error.raise("str-c: malloc failed")
+    } else {
+      _m := libc_memcpy(p, hb, hl)
+      offs := while { pos: 0, acc: [] } {
+        (pos, acc) ~> do {
+          q := next_match(p, hl, nbv, nl, pos)
+          if q < 0 {
+            { out: l_rev(acc) }
+          } else {
+            step := if overlap { 1 } else { nl }
+            { state: { pos: q + step, acc: [q, ...acc] } }
+          }
+        }
+      }
+      _f := libc_free(p)
+      offs
+    }
+  }
+}
+
+--- byte offset -> scalar index (count of lead bytes before it)
+byte_to_char := (hb, q) ~> chars_before(bytes.to_list(hb), q)
+
+join_impl := (xs, sep) ~> match xs {
+  []: "",
+  [h, ...t]: do {
+    acc := h
+    for x in t { do { acc := acc + sep + x } }
+    acc
+  }
+}
+
+-- contract surface (untyped exports -- the *-c convention: a type
+-- annotation is treated as a callee and fails for imported arrow
+-- types; see cli-c/intl-c/unicode-c) -----------------------------------------
+
+--- Whether the host `libicuuc` was found and its case-map symbols resolved.
+export icu_available := avail
+
+--- The detected ICU major version (0 when unavailable).
+export icu_version := icu_ver
+
+--- `s` uppercased -- ICU `u_strToUpper` (full case mapping), per-char
+--- `char.to_upper` fallback when ICU is absent.
+export upper := (s) ~> if !icu_case_ok {
+  case_fallback(s, "upper")
+} else {
+  match icu_xcase(s, up_sym) {
+    ok(v): v,
+    err(m): error.raise("str-c: upper: " + m)
+  }
+}
+
+--- `s` lowercased -- ICU `u_strToLower` (context-sensitive Final_Sigma,
+--- matching the native `str::to_lowercase`), per-char fallback otherwise.
+export lower := (s) ~> if !icu_case_ok {
+  case_fallback(s, "lower")
+} else {
+  match icu_xcase(s, lo_sym) {
+    ok(v): v,
+    err(m): error.raise("str-c: lower: " + m)
+  }
+}
+
+--- Scalar-value count (Unicode code points, not bytes).
+export length := (s) ~> str_length(s)
+
+--- `a` followed by `b`.
+export concat := (a, b) ~> a + b
+
+--- Whether `s` is the empty string.
+export is_empty := (s) ~> s == ""
+
+--- Exact string equality (the runtime's native compare -- already the
+--- fast path; a `memcmp` round-trip through `Bytes` would only add
+--- marshaling cost).
+export equals := (a, b) ~> a == b
+
+--- Whether `s` contains `pat` (empty `pat` is always contained).
+export contains := (s, pat) ~> do {
+  if pat == "" {
+    true
+  } else {
+    hb := bts(s)
+    nbv := bts(pat)
+    hl := nb(hb)
+    nl := nb(nbv)
+    if nl > hl {
+      false
+    } else {
+      offs := scan_matches(hb, nbv, false)
+      list_len(offs) > 0
+    }
+  }
+}
+
+--- Whether `s` starts with `pat` -- byte-prefix `memcmp`.
+export starts_with := (s, pat) ~> do {
+  sb := bts(s)
+  pb := bts(pat)
+  sl := nb(sb)
+  pl := nb(pb)
+  pl <= sl && (pl == 0 || c_memcmp(sb, pb, pl) == 0)
+}
+
+--- Whether `s` ends with `pat` -- byte-suffix `memcmp` on the tail slice.
+export ends_with := (s, pat) ~> do {
+  sb := bts(s)
+  pb := bts(pat)
+  sl := nb(sb)
+  pl := nb(pb)
+  pl <= sl && (pl == 0 || c_memcmp(bytes.slice(sb, sl - pl, pl), pb, pl) == 0)
+}
+
+--- Non-overlapping occurrences of `pat` in `s` (empty `pat` -> n+1,
+--- matching `str::matches("")` and the reference impl).
+export count := (s, pat) ~> do {
+  if pat == "" {
+    str_length(s) + 1
+  } else {
+    list_len(scan_matches(bts(s), bts(pat), false))
+  }
+}
+
+--- Scalar index of the first occurrence of `pat`, or -1 (empty `pat` -> 0).
+export find := (s, pat) ~> do {
+  if pat == "" {
+    0
+  } else {
+    hb := bts(s)
+    offs := scan_matches(hb, bts(pat), false)
+    q := at(offs, 0)
+    if q == null {
+      -1
+    } else {
+      byte_to_char(hb, q)
+    }
+  }
+}
+
+--- Scalar index of the LAST occurrence (overlapping matches count), or -1.
+export rfind := (s, pat) ~> do {
+  if pat == "" {
+    str_length(s)
+  } else {
+    hb := bts(s)
+    offs := scan_matches(hb, bts(pat), true)
+    q := at(offs, list_len(offs) - 1)
+    if q == null {
+      -1
+    } else {
+      byte_to_char(hb, q)
+    }
+  }
+}
+
+--- Split `s` on non-overlapping `sep` occurrences (empty pieces kept).
+--- Empty `sep` -> `["", c1, "", c2, ..., ""]` (the reference impl's shape).
+export split := (s, sep) ~> do {
+  if sep == "" {
+    while { cs: char.chars(s), acc: [""] } {
+      (cs, acc) ~> match cs {
+        []: { out: [...acc, ""] },
+        [h, ...t]: { state: { cs: t, acc: [...acc, h] } }
+      }
+    }
+  } else {
+    hb := bts(s)
+    nbv := bts(sep)
+    nl := nb(nbv)
+    if nl > nb(hb) {
+      [s]
+    } else {
+      offs := scan_matches(hb, nbv, false)
+      hl := nb(hb)
+      while { pos: 0, rest: offs, acc: [] } {
+        (pos, rest, acc) ~> do {
+          piece := if rest == [] {
+            bytes.utf8_decode(bytes.slice(hb, pos, hl - pos))
+          } else {
+            bytes.utf8_decode(bytes.slice(hb, pos, at(rest, 0) - pos))
+          }
+          if rest == [] {
+            { out: l_rev([piece, ...acc]) }
+          } else {
+            { state: { pos: at(rest, 0) + nl, rest: drop(rest, 1), acc: [piece, ...acc] } }
+          }
+        }
+      }
+    }
+  }
+}
+
+--- Join a list of strings with `sep`.
+export join := (xs, sep) ~> join_impl(xs, sep)
+
+--- Replace all non-overlapping occurrences of `old` with `to`.
+--- Empty `old` inserts `to` at every scalar boundary (incl. both ends).
+export replace := (s, old, to) ~> do {
+  if old == "" {
+    cs := char.chars(s)
+    match cs {
+      []: to,
+      _: do {
+        j := join_impl(cs, to)
+        to + j + to
+      }
+    }
+  } else {
+    hb := bts(s)
+    nbv := bts(old)
+    nl := nb(nbv)
+    hl := nb(hb)
+    if nl > hl {
+      s
+    } else {
+      tb := bts(to)
+      offs := scan_matches(hb, nbv, false)
+      acc := while { pos: 0, rest: offs, buf: bytes.from_list([]) } {
+        (pos, rest, buf) ~> do {
+          if rest == [] {
+            { out: bytes.concat(buf, bytes.slice(hb, pos, hl - pos)) }
+          } else {
+            q := at(rest, 0)
+            b1 := bytes.concat(buf, bytes.slice(hb, pos, q - pos))
+            b2 := bytes.concat(b1, tb)
+            { state: { pos: q + nl, rest: drop(rest, 1), buf: b2 } }
+          }
+        }
+      }
+      bytes.utf8_decode(acc)
+    }
+  }
+}
+
+--- Replace the first occurrence of `old` with `to` (empty `old` -> `to + s`).
+export replace_first := (s, old, to) ~> do {
+  if old == "" {
+    to + s
+  } else {
+    hb := bts(s)
+    nbv := bts(old)
+    nl := nb(nbv)
+    hl := nb(hb)
+    if nl > hl {
+      s
+    } else {
+      offs := scan_matches(hb, nbv, false)
+      q := at(offs, 0)
+      if q == null {
+        s
+      } else {
+        tb := bts(to)
+        p1 := bytes.slice(hb, 0, q)
+        p2 := bytes.slice(hb, q + nl, hl - q - nl)
+        bytes.utf8_decode(bytes.concat(p1, bytes.concat(tb, p2)))
+      }
+    }
+  }
+}
+
+--- `s` repeated `n` times (`n` must be >= 0 per the contract).
+export repeat := (s, n) ~> if n <= 0 || s == "" {
+  ""
+} else {
+  while { n: n, acc: "" } {
+    (n, acc) ~> if n <= 0 {
+      { out: acc }
+    } else {
+      { state: { n: n - 1, acc: acc + s } }
+    }
+  }
+}
+
+--- The scalar-value char at index `i` (raises out of bounds, like `char.at`).
+export char_at := (s, i) ~> do {
+  hb := bts(s)
+  offs := offs_of(hb)
+  n := list_len(offs)
+  if i < 0 || i >= n {
+    error.raise("str-c: char_at: index " + type.to_string(i) + " out of bounds (char count: " + type.to_string(n) + ")")
+  } else {
+    so := at(offs, i)
+    eo := if i + 1 >= n { nb(hb) } else { at(offs, i + 1) }
+    bytes.utf8_decode(bytes.slice(hb, so, eo - so))
+  }
+}
+
+--- Char-index range slice `s[a..b)`, clamped to the string bounds.
+export slice := (s, a, b) ~> str_slice(s, a, b)
+
+--- Remove `p` from the front of `s` when present (byte-prefix check).
+export strip_prefix := (s, p) ~> do {
+  sb := bts(s)
+  pb := bts(p)
+  sl := nb(sb)
+  pl := nb(pb)
+  if pl <= sl && (pl == 0 || c_memcmp(sb, pb, pl) == 0) {
+    bytes.utf8_decode(bytes.slice(sb, pl, sl - pl))
+  } else {
+    s
+  }
+}
+
+--- Remove `p` from the end of `s` when present (byte-suffix check).
+export strip_suffix := (s, p) ~> do {
+  sb := bts(s)
+  pb := bts(p)
+  sl := nb(sb)
+  pl := nb(pb)
+  if pl <= sl && (pl == 0 || c_memcmp(bytes.slice(sb, sl - pl, pl), pb, pl) == 0) {
+    bytes.utf8_decode(bytes.slice(sb, 0, sl - pl))
+  } else {
+    s
+  }
+}
+
+--- Split `s` at scalar index `i` into `[left, right]` (`i` clamps to n).
+export split_at := (s, i) ~> do {
+  hb := bts(s)
+  bl := nb(hb)
+  offs := offs_of(hb)
+  n := list_len(offs)
+  mid := if i < 0 { 0 } else if i > n { n } else { i }
+  mo := if mid >= n { bl } else { at(offs, mid) }
+  [bytes.utf8_decode(bytes.slice(hb, 0, mo)), bytes.utf8_decode(bytes.slice(hb, mo, bl - mo))]
+}
+
+--- Truncate `s` to `m` chars; appends "..." when `m >= 3` and the string
+--- is longer (the reference impl's fixed suffix).
+export truncate := (s, m) ~> do {
+  c := str_length(s)
+  if c <= m {
+    s
+  } else if m < 3 {
+    str_slice(s, 0, m)
+  } else {
+    str_slice(s, 0, m - 3) + "..."
+  }
+}
+
+-- delegated ops (str-handl -- the pure-handl reference for this contract) ---------
+
+--- Remove leading and trailing whitespace.
+export trim := (s) ~> sh.trim(s)
+
+--- Remove leading whitespace.
+export trim_start := (s) ~> sh.trim_start(s)
+
+--- Remove trailing whitespace.
+export trim_end := (s) ~> sh.trim_end(s)
+
+--- Remove leading/trailing chars appearing in `set`.
+export trim_matches := (s, set) ~> sh.trim_matches(s, set)
+
+--- Reverse `s` by scalar value.
+export reverse := (s) ~> sh.reverse(s)
+
+--- Whether `s` is non-empty and all-alphabetic.
+export is_alpha := (s) ~> sh.is_alpha(s)
+
+--- Whether `s` is non-empty and all-numeric.
+export is_numeric := (s) ~> sh.is_numeric(s)
+
+--- Whether `s` is non-empty and all-alphanumeric.
+export is_alphanumeric := (s) ~> sh.is_alphanumeric(s)
+
+--- Uppercase the first char, lowercase the rest.
+export capitalize := (s) ~> sh.capitalize(s)
+
+--- Uppercase the first char of each whitespace-delimited word.
+export title_case := (s) ~> sh.title_case(s)
+
+--- `s` in snake_case.
+export snake_case := (s) ~> sh.snake_case(s)
+
+--- `s` in camelCase.
+export camel_case := (s) ~> sh.camel_case(s)
+
+--- `s` in PascalCase.
+export pascal_case := (s) ~> sh.pascal_case(s)
+
+--- `s` in kebab-case.
+export kebab_case := (s) ~> sh.kebab_case(s)
+
+--- Levenshtein edit distance (scalar values).
+export levenshtein := (a, b) ~> sh.levenshtein(a, b)
+
+--- Normalized similarity ratio in [0, 1].
+export similarity := (a, b) ~> sh.similarity(a, b)
+
+--- Split `s` into lines (\n and \r\n; trailing newline produces no
+--- trailing empty piece).
+export lines := (s) ~> sh.lines(s)
+
+--- Split `s` on Unicode whitespace runs.
+export split_whitespace := (s) ~> sh.split_whitespace(s)
+
+--- `s` as a URL-safe slug.
+export slugify := (s) ~> sh.slugify(s)
+
+--- Pad `s` on the left with `p` cycled to `n` chars.
+export pad_left := (s, n, p) ~> sh.pad_left(s, n, p)
+
+--- Pad `s` on the right with `p` cycled to `n` chars.
+export pad_right := (s, n, p) ~> sh.pad_right(s, n, p)
+
+--- Wrap `s` to `w` columns.
+export word_wrap := (s, w) ~> sh.word_wrap(s, w)
