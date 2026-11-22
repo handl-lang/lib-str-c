@@ -289,8 +289,12 @@ icu_xcase := (s, sym) ~> do {
   while { cap: e.len * 3 + 32, tries: 0 } {
     (cap, tries) ~> do {
       desc := "out_ptr:" + type.to_string(cap * 2)
-      r := ffi.call(uc, sym, [cap, e.bytes, e.len, "", 0, 0],
-        [desc, "i32", "in_ptr", "i32", "cstr", "u32", "io_scalar:i32"], "i32", false)
+      -- u_strToUpper/u_strToLower: (dest, destCapacity, src, srcLength,
+      -- locale, status) -- SIX C args. Unlike u_strFoldCase there is no
+      -- u32 options slot; an extra descriptor here shifts `status` out of
+      -- position 6 and ICU writes UErrorCode through a null pointer.
+      r := ffi.call(uc, sym, [cap, e.bytes, e.len, "", 0],
+        [desc, "i32", "in_ptr", "i32", "cstr", "io_scalar:i32"], "i32", false)
       if type.of(r) != "object" {
         { out: err("ffi call failed") }
       } else {
