@@ -10,7 +10,7 @@ written in Handl over the C FFI (`ffi.call`).
 | `src/index.hnl` | the backend implementation |
 | `src/index.test.hnl` | the .hnl test suite |
 | `pkg.hnl` | manifest — deps `str` + `str-handl` |
-| `scripts/hnl-gate.sh`, `ci.sh` | the gate / bupha entry |
+| `scripts/hnl-gate.sh`, `workflows/gate.yaml` | the gate / bupha entry |
 
 ## Contract
 
