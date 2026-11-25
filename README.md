@@ -32,7 +32,7 @@ Diagnostic extras: `icu_available`, `icu_version`.
 ```text
 src/        the .hnl sources (index.hnl + index.test.hnl)
 pkg.hnl     package manifest — modules, deps, description, license
-ci.sh       bupha entry → scripts/hnl-gate.sh
+workflows/gate.yaml       bupha entry (handl-gates) → scripts/hnl-gate.sh
 ```
 
 ## Gate
